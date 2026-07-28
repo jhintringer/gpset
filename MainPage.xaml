@@ -1,0 +1,78 @@
+﻿<?xml version="1.0" encoding="utf-8" ?>
+<ContentPage
+  x:Class="GPSet.MainPage"
+  xmlns="http://schemas.microsoft.com/dotnet/2021/maui"
+  xmlns:x="http://schemas.microsoft.com/winfx/2009/xaml"
+  xmlns:mapsui="clr-namespace:Mapsui.UI.Maui;assembly=Mapsui.UI.Maui"
+  Shell.NavBarIsVisible="False">
+  <Grid BackgroundColor="#101418" RowDefinitions="*,Auto">
+    <Grid IsClippedToBounds="True">
+      <mapsui:MapView
+        x:Name="MapView"
+        IsMyLocationButtonVisible="False"
+        IsNorthingButtonVisible="False"
+        IsZoomButtonVisible="False" />
+      <Label
+        Margin="8"
+        Padding="5,2"
+        BackgroundColor="#BBFFFFFF"
+        FontSize="10"
+        HorizontalOptions="End"
+        Text="Imagery © Google"
+        TextColor="#202124"
+        VerticalOptions="End" />
+      <Grid
+        x:Name="Crosshair"
+        HeightRequest="48"
+        HorizontalOptions="Center"
+        InputTransparent="True"
+        VerticalOptions="Center"
+        WidthRequest="48">
+        <BoxView
+          HeightRequest="48"
+          WidthRequest="2"
+          Color="#F44336" />
+        <BoxView
+          HeightRequest="2"
+          WidthRequest="48"
+          Color="#F44336" />
+        <Border
+          HeightRequest="18"
+          Stroke="#F44336"
+          StrokeShape="RoundRectangle 9"
+          StrokeThickness="2"
+          WidthRequest="18" />
+      </Grid>
+    </Grid>
+    <Grid
+      Grid.Row="1"
+      Padding="16,12,16,18"
+      BackgroundColor="#171C21"
+      ColumnDefinitions="*,Auto"
+      ColumnSpacing="14">
+      <VerticalStackLayout Spacing="2" VerticalOptions="Center">
+        <Label
+          FontSize="10"
+          Text="SELECTED POSITION"
+          TextColor="#8FA1B2" />
+        <Label
+          x:Name="CoordinatesLabel"
+          FontAttributes="Bold"
+          FontSize="15"
+          Text="--"
+          TextColor="White" />
+      </VerticalStackLayout>
+      <Button
+        x:Name="SimulationButton"
+        Grid.Column="1"
+        BackgroundColor="#2E7D32"
+        Clicked="OnSimulationButtonClicked"
+        CornerRadius="12"
+        FontAttributes="Bold"
+        HeightRequest="52"
+        Text="START"
+        TextColor="White"
+        WidthRequest="120" />
+    </Grid>
+  </Grid>
+</ContentPage>

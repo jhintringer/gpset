@@ -8,10 +8,19 @@ using Android.OS;
 using Android.Provider;
 using AndroidX.Core.App;
 using AndroidX.Core.Content;
+using System.Diagnostics;
 using Application = Android.App.Application;
 using OperatingSystem = System.OperatingSystem;
 
 namespace GPSet.Platforms.Android;
+
+public sealed class MockPositionChangedEventArgs(
+    double latitude, double longitude, int passedWaypoints) : EventArgs
+{
+    public double Latitude { get; } = latitude;
+    public double Longitude { get; } = longitude;
+    public int PassedWaypoints { get; } = passedWaypoints;
+}
 
 [Service(
     Name = "dev.gpset.MockLocationService",
@@ -24,6 +33,12 @@ public sealed class MockLocationService : Service
     private const int NotificationContentRequestCode = 4108;
     private const string LatitudeExtra = "latitude";
     private const string LongitudeExtra = "longitude";
+    private const string WalkingExtra = "walking";
+    private const string SpeedExtra = "speed";
+    private const string WaypointLatitudesExtra = "waypoint-latitudes";
+    private const string WaypointLongitudesExtra = "waypoint-longitudes";
+    private const double WalkingSpeedMetersPerSecond = 1.4;
+    private const double EarthRadiusMeters = 6_371_000;
 
     private static readonly string[] ProviderNames =
     {
@@ -32,18 +47,27 @@ public sealed class MockLocationService : Service
     };
 
     private readonly List<string> _activeProviders = [];
+    private readonly List<GeoPosition> _route = [];
+    private readonly object _positionLock = new();
     private LocationManager? _locationManager;
     private Timer? _timer;
     private double _latitude;
     private double _longitude;
+    private float _bearing;
+    private float _speed;
+    private long _lastPlaybackTick;
+    private bool _walking;
     private int _consecutivePublishFailures;
+    private static MockLocationService? _instance;
 
     public static bool IsRunning { get; private set; }
     public static bool IsStarting { get; private set; }
+    public static bool IsWalking { get; private set; }
     public static string? LastError { get; private set; }
     public static double? MockLatitude { get; private set; }
     public static double? MockLongitude { get; private set; }
     public static event EventHandler? StateChanged;
+    public static event EventHandler<MockPositionChangedEventArgs>? PositionChanged;
 
     public override IBinder? OnBind(Intent? intent) => null;
 
@@ -51,7 +75,7 @@ public sealed class MockLocationService : Service
     {
         var context = Application.Context;
         var appOps = (AppOpsManager?)context.GetSystemService(Context.AppOpsService);
-        return appOps?.CheckOpNoThrow("android:mock_location", Process.MyUid(),
+        return appOps?.CheckOpNoThrow("android:mock_location", global::Android.OS.Process.MyUid(),
             context.PackageName!) == AppOpsManagerMode.Allowed;
     }
 
@@ -80,29 +104,58 @@ public sealed class MockLocationService : Service
 
     public static void Start(double latitude, double longitude)
     {
-        if (!double.IsFinite(latitude) || latitude is < -90 or > 90 ||
-            !double.IsFinite(longitude) || longitude is < -180 or > 180)
+        var position = new GeoPosition(latitude, longitude);
+        if (!position.IsValid)
         {
-            SetState(false, false, "The selected coordinates are invalid.");
+            SetState(false, false, false,
+                "The selected coordinates are invalid.", clearPosition: true);
             return;
         }
 
         MockLatitude = latitude;
         MockLongitude = longitude;
-        SetState(false, true, null);
-        try
+        SetState(false, true, false, null);
+
+        var intent = CreateStartIntent(position, []);
+        StartForegroundService(intent);
+    }
+
+    public static void StartRoute(
+        GeoPosition start, IReadOnlyList<GeoPosition> waypoints,
+        double speedMetersPerSecond)
+    {
+        if (!start.IsValid || waypoints.Count == 0 ||
+            waypoints.Any(x => !x.IsValid) ||
+            !IsValidSpeed(speedMetersPerSecond))
         {
-            var context = Application.Context;
-            var intent = new Intent(context, typeof(MockLocationService));
-            intent.PutExtra(LatitudeExtra, latitude);
-            intent.PutExtra(LongitudeExtra, longitude);
-            ContextCompat.StartForegroundService(context, intent);
+            SetState(IsRunning, false, false, "The walking route is invalid.");
+            return;
         }
-        catch (Exception exception)
-        {
-            global::Android.Util.Log.Error("GPSet", exception.ToString());
-            SetState(false, false, $"Could not start simulation: {exception.Message}");
-        }
+
+        MockLatitude = start.Latitude;
+        MockLongitude = start.Longitude;
+        SetState(IsRunning, !IsRunning, true, null);
+
+        var intent = CreateStartIntent(start, waypoints, speedMetersPerSecond);
+        StartForegroundService(intent);
+    }
+
+    public static void SetWalkingSpeed(double speedMetersPerSecond)
+    {
+        if (IsValidSpeed(speedMetersPerSecond))
+            _instance?.UpdateWalkingSpeed((float)speedMetersPerSecond);
+    }
+
+    private static bool IsValidSpeed(double speedMetersPerSecond) =>
+        double.IsFinite(speedMetersPerSecond) &&
+        speedMetersPerSecond is >= 0.1 and <= 100;
+
+    public static void StopWalking()
+    {
+        if (!IsWalking)
+            return;
+
+        _instance?.HoldCurrentPosition();
     }
 
     public static void Stop()
@@ -110,7 +163,40 @@ public sealed class MockLocationService : Service
         var context = Application.Context;
         context.StopService(new Intent(context, typeof(MockLocationService)));
         NotificationManagerCompat.From(context)?.Cancel(NotificationId);
-        SetState(false, false, null);
+        SetState(false, false, false, null, clearPosition: true);
+    }
+
+    private static Intent CreateStartIntent(
+        GeoPosition start, IReadOnlyList<GeoPosition> waypoints,
+        double speedMetersPerSecond = WalkingSpeedMetersPerSecond)
+    {
+        var intent = new Intent(Application.Context, typeof(MockLocationService));
+        intent.PutExtra(LatitudeExtra, start.Latitude);
+        intent.PutExtra(LongitudeExtra, start.Longitude);
+        intent.PutExtra(WalkingExtra, waypoints.Count > 0);
+        intent.PutExtra(SpeedExtra, speedMetersPerSecond);
+        if (waypoints.Count > 0)
+        {
+            intent.PutExtra(WaypointLatitudesExtra,
+                waypoints.Select(x => x.Latitude).ToArray());
+            intent.PutExtra(WaypointLongitudesExtra,
+                waypoints.Select(x => x.Longitude).ToArray());
+        }
+        return intent;
+    }
+
+    private static new void StartForegroundService(Intent intent)
+    {
+        try
+        {
+            ContextCompat.StartForegroundService(Application.Context, intent);
+        }
+        catch (Exception exception)
+        {
+            global::Android.Util.Log.Error("GPSet", exception.ToString());
+            SetState(false, false, false,
+                $"Could not start simulation: {exception.Message}", clearPosition: true);
+        }
     }
 
     public override StartCommandResult OnStartCommand(
@@ -118,13 +204,14 @@ public sealed class MockLocationService : Service
     {
         if (intent is null)
         {
-            SetState(false, false, "Simulation start data was missing.");
+            SetState(false, false, false,
+                "Simulation start data was missing.", clearPosition: true);
             StopSelf();
             return StartCommandResult.NotSticky;
         }
 
-        _latitude = intent.GetDoubleExtra(LatitudeExtra, double.NaN);
-        _longitude = intent.GetDoubleExtra(LongitudeExtra, double.NaN);
+        _instance = this;
+        ConfigurePosition(intent);
         StartForeground(NotificationId, CreateNotification());
 
         try
@@ -135,17 +222,61 @@ public sealed class MockLocationService : Service
             if (!IsSystemLocationEnabled())
                 throw new InvalidOperationException("Android Location is turned off.");
 
-            BeginMocking();
-            SetState(true, false, null);
+            if (_locationManager is null)
+                BeginMocking();
+            else if (!PublishLocation())
+                throw new InvalidOperationException(
+                    "Android rejected the updated mock GPS location.");
+
+            EnsureTimer();
+            SetState(true, false, _walking, null);
         }
         catch (Exception exception)
         {
             global::Android.Util.Log.Error("GPSet", exception.ToString());
-            SetState(false, false, $"Simulation failed: {exception.Message}");
+            SetState(false, false, false,
+                $"Simulation failed: {exception.Message}", clearPosition: true);
             StopSelf();
         }
 
         return StartCommandResult.NotSticky;
+    }
+
+    private void ConfigurePosition(Intent intent)
+    {
+        double latitude = intent.GetDoubleExtra(LatitudeExtra, double.NaN);
+        double longitude = intent.GetDoubleExtra(LongitudeExtra, double.NaN);
+        bool walking = intent.GetBooleanExtra(WalkingExtra, false);
+        double speedMetersPerSecond = intent.GetDoubleExtra(
+            SpeedExtra, WalkingSpeedMetersPerSecond);
+        double[] latitudes = intent.GetDoubleArrayExtra(WaypointLatitudesExtra) ?? [];
+        double[] longitudes = intent.GetDoubleArrayExtra(WaypointLongitudesExtra) ?? [];
+
+        var start = new GeoPosition(latitude, longitude);
+        if (!start.IsValid || latitudes.Length != longitudes.Length ||
+            (walking && !IsValidSpeed(speedMetersPerSecond)))
+            throw new InvalidOperationException("The simulation route data is invalid.");
+
+        lock (_positionLock)
+        {
+            _latitude = latitude;
+            _longitude = longitude;
+            _bearing = 0;
+            _speed = walking ? (float)speedMetersPerSecond : 0;
+            _walking = walking;
+            _route.Clear();
+            for (int i = 0; i < latitudes.Length; i++)
+            {
+                var waypoint = new GeoPosition(latitudes[i], longitudes[i]);
+                if (!waypoint.IsValid)
+                    throw new InvalidOperationException(
+                        "The simulation route contains invalid coordinates.");
+                _route.Add(waypoint);
+            }
+            _lastPlaybackTick = Stopwatch.GetTimestamp();
+            MockLatitude = latitude;
+            MockLongitude = longitude;
+        }
     }
 
     private void BeginMocking()
@@ -169,10 +300,15 @@ public sealed class MockLocationService : Service
 
         if (!PublishLocation())
             throw new InvalidOperationException("Android rejected the first mock GPS location.");
+    }
 
-        _timer?.Dispose();
+    private void EnsureTimer()
+    {
+        if (_timer is not null)
+            return;
+
         _timer = new Timer(_ => PublishOnTimer(), null,
-            TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(1));
+            TimeSpan.FromMilliseconds(250), TimeSpan.FromMilliseconds(250));
     }
 
     private bool TryConfigureProvider(string provider, out string? error)
@@ -195,8 +331,8 @@ public sealed class MockLocationService : Service
                 builder.SetAccuracy((int)Accuracy.Fine);
                 builder.SetPowerUsage((int)Power.Low);
                 builder.SetHasAltitudeSupport(false);
-                builder.SetHasSpeedSupport(false);
-                builder.SetHasBearingSupport(false);
+                builder.SetHasSpeedSupport(true);
+                builder.SetHasBearingSupport(true);
                 var properties = builder.Build()
                     ?? throw new InvalidOperationException("Could not create provider properties.");
                 _locationManager!.AddTestProvider(provider, properties);
@@ -210,8 +346,8 @@ public sealed class MockLocationService : Service
                     requiresCell: false,
                     hasMonetaryCost: false,
                     supportsAltitude: false,
-                    supportsSpeed: false,
-                    supportsBearing: false,
+                    supportsSpeed: true,
+                    supportsBearing: true,
                     powerRequirement: Power.Low,
                     accuracy: (SensorStatus)Accuracy.Fine);
             }
@@ -233,17 +369,113 @@ public sealed class MockLocationService : Service
         if (!IsRunning)
             return;
 
+        int passedWaypoints = AdvanceWalkingPosition(out bool completed);
         if (PublishLocation())
         {
             _consecutivePublishFailures = 0;
+        }
+        else if (++_consecutivePublishFailures >= 3)
+        {
+            SetState(false, false, false,
+                "Android repeatedly rejected the mock GPS location.", clearPosition: true);
+            StopSelf();
             return;
         }
 
-        if (++_consecutivePublishFailures < 3)
+        if (!_walking && passedWaypoints == 0 && !completed)
             return;
 
-        SetState(false, false, "Android repeatedly rejected the mock GPS location.");
-        StopSelf();
+        double latitude;
+        double longitude;
+        lock (_positionLock)
+        {
+            latitude = _latitude;
+            longitude = _longitude;
+        }
+        PositionChanged?.Invoke(null,
+            new MockPositionChangedEventArgs(latitude, longitude, passedWaypoints));
+
+        if (completed)
+            SetState(true, false, false, null);
+    }
+
+    private int AdvanceWalkingPosition(out bool completed)
+    {
+        completed = false;
+        lock (_positionLock)
+        {
+            if (!_walking)
+                return 0;
+
+            double elapsedSeconds = Stopwatch
+                .GetElapsedTime(_lastPlaybackTick).TotalSeconds;
+            _lastPlaybackTick = Stopwatch.GetTimestamp();
+            double remainingDistance = elapsedSeconds * _speed;
+            int passedWaypoints = 0;
+
+            while (_route.Count > 0)
+            {
+                var current = new GeoPosition(_latitude, _longitude);
+                var target = _route[0];
+                double segmentDistance = DistanceMeters(current, target);
+                _bearing = (float)BearingDegrees(current, target);
+
+                if (segmentDistance <= remainingDistance || segmentDistance < 0.01)
+                {
+                    _latitude = target.Latitude;
+                    _longitude = target.Longitude;
+                    remainingDistance = Math.Max(0, remainingDistance - segmentDistance);
+                    _route.RemoveAt(0);
+                    passedWaypoints++;
+                    continue;
+                }
+
+                var next = Interpolate(current, target,
+                    remainingDistance / segmentDistance);
+                _latitude = next.Latitude;
+                _longitude = next.Longitude;
+                break;
+            }
+
+            if (_route.Count == 0)
+            {
+                _walking = false;
+                _speed = 0;
+                completed = true;
+            }
+
+            MockLatitude = _latitude;
+            MockLongitude = _longitude;
+            IsWalking = _walking;
+            return passedWaypoints;
+        }
+    }
+
+    private void UpdateWalkingSpeed(float speedMetersPerSecond)
+    {
+        lock (_positionLock)
+        {
+            if (_walking)
+                _speed = speedMetersPerSecond;
+        }
+    }
+
+    private void HoldCurrentPosition()
+    {
+        lock (_positionLock)
+        {
+            _walking = false;
+            _speed = 0;
+            _route.Clear();
+            MockLatitude = _latitude;
+            MockLongitude = _longitude;
+            IsWalking = false;
+        }
+
+        PublishLocation();
+        StateChanged?.Invoke(null, EventArgs.Empty);
+        PositionChanged?.Invoke(null,
+            new MockPositionChangedEventArgs(_latitude, _longitude, 0));
     }
 
     private bool PublishLocation()
@@ -251,14 +483,28 @@ public sealed class MockLocationService : Service
         if (_locationManager is null)
             return false;
 
+        double latitude;
+        double longitude;
+        float speed;
+        float bearing;
+        lock (_positionLock)
+        {
+            latitude = _latitude;
+            longitude = _longitude;
+            speed = _speed;
+            bearing = _bearing;
+        }
+
         bool gpsPublished = false;
         foreach (string provider in _activeProviders.ToArray())
         {
             using var location = new global::Android.Locations.Location(provider)
             {
-                Latitude = _latitude,
-                Longitude = _longitude,
+                Latitude = latitude,
+                Longitude = longitude,
                 Accuracy = 1f,
+                Speed = speed,
+                Bearing = bearing,
                 Time = Java.Lang.JavaSystem.CurrentTimeMillis(),
                 ElapsedRealtimeNanos = SystemClock.ElapsedRealtimeNanos()
             };
@@ -338,18 +584,72 @@ public sealed class MockLocationService : Service
         _timer = null;
         RemoveActiveProviders();
         _locationManager = null;
-        SetState(false, false, LastError);
+        _instance = null;
+        SetState(false, false, false, LastError, clearPosition: true);
         StopForeground(StopForegroundFlags.Remove);
         NotificationManagerCompat.From(this)?.Cancel(NotificationId);
         base.OnDestroy();
     }
 
-    private static void SetState(bool running, bool starting, string? error)
+    private static double DistanceMeters(GeoPosition from, GeoPosition to)
+    {
+        double latitude1 = DegreesToRadians(from.Latitude);
+        double latitude2 = DegreesToRadians(to.Latitude);
+        double deltaLatitude = latitude2 - latitude1;
+        double deltaLongitude = DegreesToRadians(
+            NormalizeLongitudeDelta(to.Longitude - from.Longitude));
+        double a = Math.Pow(Math.Sin(deltaLatitude / 2), 2) +
+            Math.Cos(latitude1) * Math.Cos(latitude2) *
+            Math.Pow(Math.Sin(deltaLongitude / 2), 2);
+        return EarthRadiusMeters * 2 * Math.Atan2(Math.Sqrt(a), Math.Sqrt(1 - a));
+    }
+
+    private static GeoPosition Interpolate(
+        GeoPosition from, GeoPosition to, double fraction)
+    {
+        fraction = Math.Clamp(fraction, 0, 1);
+        double longitudeDelta = NormalizeLongitudeDelta(to.Longitude - from.Longitude);
+        double longitude = from.Longitude + longitudeDelta * fraction;
+        if (longitude > 180)
+            longitude -= 360;
+        else if (longitude < -180)
+            longitude += 360;
+
+        return new GeoPosition(
+            from.Latitude + (to.Latitude - from.Latitude) * fraction,
+            longitude);
+    }
+
+    private static double BearingDegrees(GeoPosition from, GeoPosition to)
+    {
+        double latitude1 = DegreesToRadians(from.Latitude);
+        double latitude2 = DegreesToRadians(to.Latitude);
+        double deltaLongitude = DegreesToRadians(
+            NormalizeLongitudeDelta(to.Longitude - from.Longitude));
+        double y = Math.Sin(deltaLongitude) * Math.Cos(latitude2);
+        double x = Math.Cos(latitude1) * Math.Sin(latitude2) -
+            Math.Sin(latitude1) * Math.Cos(latitude2) * Math.Cos(deltaLongitude);
+        return (RadiansToDegrees(Math.Atan2(y, x)) + 360) % 360;
+    }
+
+    private static double NormalizeLongitudeDelta(double delta) =>
+        (delta + 540) % 360 - 180;
+
+    private static double DegreesToRadians(double degrees) =>
+        degrees * Math.PI / 180;
+
+    private static double RadiansToDegrees(double radians) =>
+        radians * 180 / Math.PI;
+
+    private static void SetState(
+        bool running, bool starting, bool walking, string? error,
+        bool clearPosition = false)
     {
         IsRunning = running;
         IsStarting = starting;
+        IsWalking = walking;
         LastError = error;
-        if (!running && !starting)
+        if (clearPosition)
         {
             MockLatitude = null;
             MockLongitude = null;

@@ -13,7 +13,7 @@
         IsNorthingButtonVisible="False"
         IsZoomButtonVisible="False" />
       <Label
-        Margin="8"
+        Margin="8,8,8,76"
         Padding="5,2"
         BackgroundColor="#BBFFFFFF"
         FontSize="10"
@@ -43,6 +43,64 @@
           StrokeThickness="2"
           WidthRequest="18" />
       </Grid>
+      <Grid
+        x:Name="RouteControls"
+        Margin="16,12"
+        Padding="8"
+        BackgroundColor="#DD171C21"
+        ColumnDefinitions="*,*,*"
+        ColumnSpacing="8"
+        IsVisible="False"
+        VerticalOptions="End">
+        <Button
+          x:Name="PlayButton"
+          BackgroundColor="#2E7D32"
+          Clicked="OnPlayButtonClicked"
+          CornerRadius="10"
+          FontAttributes="Bold"
+          IsVisible="False"
+          Text="PLAY"
+          TextColor="White" />
+        <Button
+          x:Name="SpeedButton"
+          BackgroundColor="#6A1B9A"
+          Clicked="OnSpeedButtonClicked"
+          CornerRadius="10"
+          FontAttributes="Bold"
+          IsVisible="False"
+          Text="Walking"
+          TextColor="White" />
+        <Button
+          x:Name="StopButton"
+          Grid.Column="1"
+          Grid.ColumnSpan="2"
+          BackgroundColor="#C62828"
+          Clicked="OnStopButtonClicked"
+          CornerRadius="10"
+          FontAttributes="Bold"
+          IsVisible="False"
+          Text="STOP"
+          TextColor="White" />
+        <Button
+          x:Name="UndoButton"
+          Grid.Column="1"
+          BackgroundColor="#455A64"
+          Clicked="OnUndoButtonClicked"
+          CornerRadius="10"
+          FontAttributes="Bold"
+          IsVisible="False"
+          Text="UNDO"
+          TextColor="White" />
+        <Button
+          x:Name="WaypointButton"
+          Grid.Column="2"
+          BackgroundColor="#1565C0"
+          Clicked="OnWaypointButtonClicked"
+          CornerRadius="10"
+          FontAttributes="Bold"
+          Text="WAYPOINT"
+          TextColor="White" />
+      </Grid>
     </Grid>
     <Grid
       Grid.Row="1"
@@ -70,7 +128,7 @@
         CornerRadius="12"
         FontAttributes="Bold"
         HeightRequest="52"
-        Text="START"
+        Text="Simulate"
         TextColor="White"
         WidthRequest="120" />
     </Grid>
